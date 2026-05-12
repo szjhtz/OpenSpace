@@ -18,6 +18,7 @@ Desktop.ini
 .idea/
 .pytest_cache/
 .venv/
+.test-venv/
 
 # Distribution / packaging
 dist/
