@@ -21,10 +21,9 @@ logger = logging.getLogger("openspace.cloud")
 CLOUD_EMBEDDING_SEARCH_MAX_LIMIT = 300
 
 
-# Shared SkillRanker singleton. Its pickle cache file at
-# ``.openspace/skill_embedding_cache/skill_embeddings_v1.pkl`` survives
-# process restarts; the singleton itself is per-process and avoids reloading
-# the pickle on every search_skills invocation.
+# Shared SkillRanker singleton. Its pickle cache survives process restarts;
+# the singleton itself is per-process and avoids reloading the pickle on every
+# search_skills invocation.
 _shared_ranker = None
 
 
@@ -465,8 +464,8 @@ async def hybrid_search_skills(
                 )
                 if candidate_embedding:
                     candidate["_embedding"] = candidate_embedding
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"hybrid_search_skills: embedding unavailable: {e}")
 
     engine = SkillSearchEngine()
     return engine.search(normalized_query, candidates, query_embedding=query_embedding, limit=limit)

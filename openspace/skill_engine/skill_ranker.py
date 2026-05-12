@@ -18,12 +18,15 @@ Reused by:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
 import os
 import pickle
 import re
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -44,8 +47,11 @@ PREFILTER_THRESHOLD = 10
 # How many candidates to keep after BM25 rough-rank (before embedding re-rank)
 BM25_CANDIDATES_MULTIPLIER = 3  # top_k * 3
 
-# Cache version — increment when format changes
-_CACHE_VERSION = 1
+# Cache version — increment when format changes.
+#
+# v2 intentionally does not migrate v1 skill_id-only entries: old entries did
+# not store the source text hash, so they cannot be proven fresh.
+_CACHE_VERSION = 2
 
 
 @dataclass
@@ -82,9 +88,10 @@ class SkillRanker:
         cache_dir: Optional[Path] = None,
         enable_cache: bool = True,
     ) -> None:
-        # Embedding cache: skill_id → List[float]
+        # Embedding cache: encoded skill_id + content hash → List[float]
         self._embedding_cache: Dict[str, List[float]] = {}
         self._enable_cache = enable_cache
+        self._cache_lock = threading.RLock()
 
         if cache_dir is None:
             try:
@@ -148,16 +155,34 @@ class SkillRanker:
         return self._embedding_rank(query, candidates, top_k)
 
     @staticmethod
-    def _content_key(skill_id: str, embedding_text: str) -> str:
+    def _skill_key_prefix(skill_id: str) -> str:
+        """Return a collision-safe prefix for all cache entries of a skill."""
+        encoded = base64.urlsafe_b64encode(skill_id.encode("utf-8")).decode("ascii")
+        return f"{encoded}:"
+
+    @classmethod
+    def _content_key(cls, skill_id: str, embedding_text: str) -> str:
         """Compose a content-addressed cache key.
 
-        The cache stores embeddings under ``"{skill_id}:{sha256(text)[:16]}"``
+        The cache stores embeddings under ``"{encoded_skill_id}:{sha256(text)[:16]}"``
         so that any change to the text used for embedding (name, description,
         or body) automatically invalidates the cached entry without relying
         on an external trigger.
         """
         digest = hashlib.sha256(embedding_text.encode("utf-8")).hexdigest()[:16]
-        return f"{skill_id}:{digest}"
+        return f"{cls._skill_key_prefix(skill_id)}{digest}"
+
+    def _drop_stale_entries_locked(self, skill_id: str, keep_key: str) -> None:
+        """Drop older content-addressed entries for a skill.
+
+        Caller must hold ``self._cache_lock``.
+        """
+        prefix = self._skill_key_prefix(skill_id)
+        for stale in [
+            k for k in self._embedding_cache
+            if k != keep_key and k.startswith(prefix)
+        ]:
+            self._embedding_cache.pop(stale, None)
 
     def get_or_compute_embedding(
         self, candidate: SkillCandidate,
@@ -171,37 +196,39 @@ class SkillRanker:
             return candidate.embedding
 
         text = self._build_embedding_text(candidate)
+        if not candidate.skill_id:
+            emb = self._generate_embedding(text)
+            if emb:
+                candidate.embedding = emb
+            return emb
+
         content_key = self._content_key(candidate.skill_id, text)
-
-        # Check content-addressed cache
-        cached = self._embedding_cache.get(content_key)
-        if cached:
-            candidate.embedding = cached
-            return cached
-
-        # Backward-compat: old-format entries were keyed by skill_id alone.
-        # If present, migrate to the new key format without hitting the API.
-        legacy = self._embedding_cache.get(candidate.skill_id)
-        if legacy:
-            candidate.embedding = legacy
-            self._embedding_cache[content_key] = legacy
-            self._embedding_cache.pop(candidate.skill_id, None)
-            self._save_cache()
-            return legacy
+        dropped_legacy = False
+        with self._cache_lock:
+            # Check content-addressed cache. If a legacy in-memory entry exists,
+            # discard it instead of migrating unverifiable stale data.
+            cached = self._embedding_cache.get(content_key)
+            if cached:
+                candidate.embedding = cached
+                return cached
+            dropped_legacy = self._embedding_cache.pop(candidate.skill_id, None) is not None
 
         # Compute
         emb = self._generate_embedding(text)
-        if emb:
-            candidate.embedding = emb
-            self._embedding_cache[content_key] = emb
-            # Bound cache growth: previous versions of this skill are now
-            # obsolete, drop them in the same write.
-            for stale in [
-                k for k in self._embedding_cache
-                if k != content_key and k.startswith(f"{candidate.skill_id}:")
-            ]:
-                self._embedding_cache.pop(stale, None)
-            self._save_cache()
+        with self._cache_lock:
+            cached = self._embedding_cache.get(content_key)
+            if cached:
+                candidate.embedding = cached
+                return cached
+            if emb:
+                candidate.embedding = emb
+                self._embedding_cache[content_key] = emb
+                # Bound cache growth: previous versions of this skill are now
+                # obsolete, drop them in the same write.
+                self._drop_stale_entries_locked(candidate.skill_id, content_key)
+                self._save_cache()
+            elif dropped_legacy:
+                self._save_cache()
         return emb
 
     def invalidate_cache(self, skill_id: str) -> None:
@@ -211,19 +238,22 @@ class SkillRanker:
         ``skill_id`` (legacy format) or the ``"{skill_id}:*"`` content-addressed
         prefix, covering any historical content version that might linger.
         """
-        keys_to_drop = [
-            k for k in self._embedding_cache
-            if k == skill_id or k.startswith(f"{skill_id}:")
-        ]
-        for k in keys_to_drop:
-            self._embedding_cache.pop(k, None)
-        if keys_to_drop:
-            self._save_cache()
+        prefix = self._skill_key_prefix(skill_id)
+        with self._cache_lock:
+            keys_to_drop = [
+                k for k in self._embedding_cache
+                if k == skill_id or k.startswith(prefix)
+            ]
+            for k in keys_to_drop:
+                self._embedding_cache.pop(k, None)
+            if keys_to_drop:
+                self._save_cache()
 
     def clear_cache(self) -> None:
         """Clear all cached embeddings."""
-        self._embedding_cache.clear()
-        self._save_cache()
+        with self._cache_lock:
+            self._embedding_cache.clear()
+            self._save_cache()
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
@@ -323,30 +353,30 @@ class SkillRanker:
             if c.embedding:
                 continue
             text = self._build_embedding_text(c)
+            if not c.skill_id:
+                emb = self._generate_embedding(text, api_key=api_key)
+                if emb:
+                    c.embedding = emb
+                continue
             content_key = self._content_key(c.skill_id, text)
-            cached = self._embedding_cache.get(content_key)
-            if cached:
-                c.embedding = cached
-                continue
-            legacy = self._embedding_cache.get(c.skill_id)
-            if legacy:
-                c.embedding = legacy
-                self._embedding_cache[content_key] = legacy
-                self._embedding_cache.pop(c.skill_id, None)
-                cache_dirty = True
-                continue
+            with self._cache_lock:
+                cached = self._embedding_cache.get(content_key)
+                if cached:
+                    c.embedding = cached
+                    continue
+                # Do not migrate legacy skill_id-only entries; they may be
+                # stale because the old format did not store a text hash.
+                if self._embedding_cache.pop(c.skill_id, None) is not None:
+                    cache_dirty = True
             emb = self._generate_embedding(text, api_key=api_key)
             if emb:
                 c.embedding = emb
-                self._embedding_cache[content_key] = emb
-                # Bound cache growth: previous versions of this skill are
-                # obsolete, drop them.
-                for stale in [
-                    k for k in self._embedding_cache
-                    if k != content_key and k.startswith(f"{c.skill_id}:")
-                ]:
-                    self._embedding_cache.pop(stale, None)
-                cache_dirty = True
+                with self._cache_lock:
+                    self._embedding_cache[content_key] = emb
+                    # Bound cache growth: previous versions of this skill are
+                    # obsolete, drop them.
+                    self._drop_stale_entries_locked(c.skill_id, content_key)
+                    cache_dirty = True
 
         # Save newly computed / migrated embeddings
         if cache_dirty:
@@ -424,8 +454,14 @@ class SkillRanker:
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
-            if isinstance(data, dict) and data.get("version") == _CACHE_VERSION:
-                self._embedding_cache = data.get("embeddings", {})
+            if (
+                isinstance(data, dict)
+                and data.get("version") == _CACHE_VERSION
+                and data.get("model") == SKILL_EMBEDDING_MODEL
+                and isinstance(data.get("embeddings"), dict)
+            ):
+                with self._cache_lock:
+                    self._embedding_cache = data.get("embeddings", {})
                 logger.debug(f"Loaded {len(self._embedding_cache)} skill embeddings from cache")
         except Exception as e:
             logger.warning(f"Failed to load skill embedding cache: {e}")
@@ -433,18 +469,32 @@ class SkillRanker:
 
     def _save_cache(self) -> None:
         """Persist embedding cache to disk."""
-        if not self._enable_cache or not self._embedding_cache:
+        if not self._enable_cache:
             return
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
-            data = {
-                "version": _CACHE_VERSION,
-                "model": SKILL_EMBEDDING_MODEL,
-                "last_updated": datetime.now().isoformat(),
-                "embeddings": self._embedding_cache,
-            }
-            with open(self._cache_file(), "wb") as f:
-                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            with self._cache_lock:
+                data = {
+                    "version": _CACHE_VERSION,
+                    "model": SKILL_EMBEDDING_MODEL,
+                    "last_updated": datetime.now().isoformat(),
+                    "embeddings": dict(self._embedding_cache),
+                }
+            tmp_name = ""
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    dir=self._cache_dir,
+                    prefix=".skill_embeddings_",
+                    suffix=".tmp",
+                    delete=False,
+                ) as f:
+                    tmp_name = f.name
+                    pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_name, self._cache_file())
+            finally:
+                if tmp_name and os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
         except Exception as e:
             logger.warning(f"Failed to save skill embedding cache: {e}")
 
